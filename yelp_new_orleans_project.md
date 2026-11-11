@@ -1,0 +1,860 @@
+
+
+# Classic New Orleans Food on Yelp (Steps 1–6)
+
+**Working research question:** *Where can a visitor find the best
+classic New Orleans cooking (Cajun/Creole, seafood, Southern, and soul
+food), and which part of the city is best for finding it?*
+
+This file covers Steps 1–6 of the project: importing the data, cleaning
+it, choosing a category group, joining businesses to reviews, a spatial
+join with official boundaries, and choosing a geographic system. Step 7
+(reviewer-adjusted scores) comes next.
+
+> **How this file was made:** `yelp_new_orleans_project.qmd` was
+> rendered to this Markdown file in RStudio, so every table and map
+> below can be seen on GitHub without running any code.
+
+``` r
+# Run once if needed:
+# install.packages(c("tidyverse", "sf", "tigris", "scales", "knitr"))
+library(tidyverse)
+library(sf)
+library(tigris)
+library(scales)
+library(knitr)
+
+options(tigris_use_cache = TRUE)
+sf_use_s2(FALSE)   # planar point-in-polygon tests; fine at city scale
+dir.create("figures", showWarnings = FALSE)
+dir.create("data/boundaries", recursive = TRUE, showWarnings = FALSE)
+```
+
+## Step 1: Importing the large JSON files
+
+The raw Yelp files are not stored in this repository. The import code is
+in [`project2_load_yelp.R`](project2_load_yelp.R). It unzips the Yelp
+download, reads each JSON file with `jsonlite::stream_in()`, keeps only
+New Orleans rows, and saves them as `.rds` files in `data/`.
+
+### Large-data management
+
+- **Download:** The JSON download is a 4.35 GB zip file (8.65 GB once
+  extracted). The first attempt to download it from inside R with
+  `download.file()` failed partway through. A browser download worked,
+  and the zip was then moved into `data/raw/`.
+- **Disk space:** Extracting the files needs about 13 GB free while the
+  import runs. After the filtered `.rds` files were saved and checked,
+  the raw files in `data/raw/` could be deleted.
+- **Memory:** The review file has about 7 million rows, and loading it
+  all at once can crash R on a laptop. The script reads it in
+  100,000-row chunks
+  (`stream_in(..., pagesize = 100000, handler = ...)`) and keeps only
+  reviews of New Orleans businesses from each chunk. The tip, check-in,
+  and user files were read the same way.
+- **Time:** The full import took roughly 20–30 minutes. After that,
+  every analysis step starts from the small `.rds` files, which load in
+  seconds.
+- **GitHub:** `data/`, `*.rds`, `*.zip`, `*.tar` and `*.json` are listed
+  in `.gitignore`, because GitHub rejects files over 100 MB and the raw
+  data is far larger than that.
+
+``` r
+business <- readRDS("data/nola_business.rds")
+reviews  <- readRDS("data/nola_reviews.rds")
+
+tibble(
+  table   = c("New Orleans businesses", "Reviews of those businesses"),
+  rows    = c(nrow(business), nrow(reviews)),
+  columns = c(ncol(business), ncol(reviews))
+) |>
+  kable(format.args = list(big.mark = ","))
+```
+
+| table                       |    rows | columns |
+|:----------------------------|--------:|--------:|
+| New Orleans businesses      |   6,215 |      58 |
+| Reviews of those businesses | 635,521 |       9 |
+
+## Step 2: Clean and filter to New Orleans restaurants
+
+The import script already kept businesses whose Yelp `city` is “New
+Orleans” (ignoring capitalization and extra spaces) and whose `state` is
+“LA”. Here a business counts as a **restaurant** if its comma-separated
+`categories` field contains the label “Restaurants”. Step 5 checks the
+Yelp city label against the official Census boundary.
+
+``` r
+nola_restaurants <- business |>
+  filter(
+    !is.na(categories),
+    str_detect(categories, regex("\\bRestaurants\\b", ignore_case = TRUE))
+  ) |>
+  mutate(
+    postal_code   = na_if(postal_code, ""),
+    categories    = str_squish(categories),
+    business_name = str_squish(name)
+  ) |>
+  distinct(business_id, .keep_all = TRUE) |>
+  select(any_of(c(
+    "business_id", "business_name", "address", "city", "state",
+    "postal_code", "latitude", "longitude", "stars", "review_count",
+    "is_open", "categories"
+  )))
+
+nola_restaurants |>
+  summarise(
+    businesses_in_new_orleans = nrow(business),
+    restaurants               = n(),
+    missing_latitude          = sum(is.na(latitude)),
+    missing_longitude         = sum(is.na(longitude)),
+    missing_postal_code       = sum(is.na(postal_code)),
+    still_open                = sum(is_open == 1, na.rm = TRUE)
+  ) |>
+  kable(format.args = list(big.mark = ","))
+```
+
+| businesses_in_new_orleans | restaurants | missing_latitude | missing_longitude | missing_postal_code | still_open |
+|---:|---:|---:|---:|---:|---:|
+| 6,215 | 2,261 | 0 | 0 | 1 | 1,392 |
+
+## Step 3: Select related restaurant categories
+
+### Category counts
+
+Each restaurant can have many categories, so the `categories` field is
+split into one row per business–category pair. The labels are converted
+to lower case and stripped of extra spaces before counting. The generic
+labels “restaurants” and “food” are removed because every business has
+one of them.
+
+``` r
+restaurant_categories <- nola_restaurants |>
+  select(business_id, categories) |>
+  separate_rows(categories, sep = ",") |>
+  mutate(category = str_to_lower(str_squish(categories))) |>
+  filter(category != "", !category %in% c("restaurants", "food")) |>
+  distinct(business_id, category)
+
+category_counts <- restaurant_categories |>
+  count(category, name = "restaurants", sort = TRUE)
+
+category_counts |>
+  slice_head(n = 20) |>
+  kable(caption = "20 most common restaurant categories in New Orleans")
+```
+
+| category                  | restaurants |
+|:--------------------------|------------:|
+| nightlife                 |         541 |
+| bars                      |         509 |
+| cajun/creole              |         402 |
+| breakfast & brunch        |         367 |
+| sandwiches                |         354 |
+| seafood                   |         332 |
+| american (new)            |         324 |
+| american (traditional)    |         299 |
+| coffee & tea              |         208 |
+| burgers                   |         202 |
+| cafes                     |         173 |
+| pizza                     |         172 |
+| cocktail bars             |         161 |
+| event planning & services |         157 |
+| southern                  |         155 |
+| fast food                 |         142 |
+| mexican                   |         124 |
+| salad                     |         124 |
+| italian                   |         121 |
+| chicken wings             |         112 |
+
+20 most common restaurant categories in New Orleans
+
+### The selected category group
+
+``` r
+selected_categories <- c("cajun/creole", "seafood", "southern", "soul food")
+```
+
+These four categories cover **classic New Orleans cooking**: gumbo,
+jambalaya and étouffée (Cajun/Creole), Gulf oysters, shrimp and crawfish
+(seafood), and fried chicken, red beans and smothered greens (Southern
+and soul food). They answer the question a visitor actually asks: *where
+do I go for food I can only get done this well in New Orleans?* They
+were chosen for that theme, not because they are the most common
+categories.
+
+**Inclusion rule:** a restaurant is included if it has **at least one**
+of the four categories.
+
+``` r
+category_counts |>
+  filter(category %in% selected_categories) |>
+  kable(caption = "Restaurants in each selected category")
+```
+
+| category     | restaurants |
+|:-------------|------------:|
+| cajun/creole |         402 |
+| seafood      |         332 |
+| southern     |         155 |
+| soul food    |          70 |
+
+Restaurants in each selected category
+
+``` r
+selected_ids <- restaurant_categories |>
+  filter(category %in% selected_categories) |>
+  distinct(business_id)
+
+matches_per_restaurant <- restaurant_categories |>
+  semi_join(selected_ids, by = "business_id") |>
+  group_by(business_id) |>
+  summarise(selected_matches = sum(category %in% selected_categories)) |>
+  count(selected_matches, name = "restaurants")
+
+matches_per_restaurant |>
+  kable(caption = "How many of the four selected categories each included restaurant matches")
+```
+
+| selected_matches | restaurants |
+|-----------------:|------------:|
+|                1 |         443 |
+|                2 |         180 |
+|                3 |          48 |
+|                4 |           3 |
+
+How many of the four selected categories each included restaurant
+matches
+
+### Co-occurrence evidence
+
+If the categories belong together, restaurants should carry them
+**together** more often than chance would predict. `lift` compares the
+observed overlap of each pair with the overlap expected if the
+categories were unrelated (`lift = 1` means unrelated; `lift = 2` means
+twice as common as expected).
+
+``` r
+n_restaurants <- n_distinct(nola_restaurants$business_id)
+
+selected_long <- restaurant_categories |>
+  filter(category %in% selected_categories)
+
+pair_counts <- selected_long |>
+  inner_join(selected_long, by = "business_id",
+             relationship = "many-to-many") |>
+  filter(category.x < category.y) |>
+  count(category.x, category.y, name = "restaurants_with_both") |>
+  left_join(category_counts, by = c("category.x" = "category")) |>
+  rename(n_x = restaurants) |>
+  left_join(category_counts, by = c("category.y" = "category")) |>
+  rename(n_y = restaurants) |>
+  mutate(
+    expected_if_unrelated = round(n_x * n_y / n_restaurants, 1),
+    lift = round(restaurants_with_both / expected_if_unrelated, 2)
+  ) |>
+  arrange(desc(restaurants_with_both))
+
+pair_counts |>
+  select(category_1 = category.x, category_2 = category.y,
+         restaurants_with_both, expected_if_unrelated, lift) |>
+  kable(caption = "Category pairs within the selected group")
+```
+
+| category_1   | category_2 | restaurants_with_both | expected_if_unrelated | lift |
+|:-------------|:-----------|----------------------:|----------------------:|-----:|
+| cajun/creole | seafood    |                   156 |                  59.0 | 2.64 |
+| cajun/creole | southern   |                    72 |                  27.6 | 2.61 |
+| seafood      | southern   |                    45 |                  22.8 | 1.97 |
+| cajun/creole | soul food  |                    30 |                  12.4 | 2.42 |
+| seafood      | soul food  |                    20 |                  10.3 | 1.94 |
+| soul food    | southern   |                    19 |                   4.8 | 3.96 |
+
+Category pairs within the selected group
+
+``` r
+cooccur_plot <- pair_counts |>
+  mutate(pair = paste(str_to_title(category.x), "+", str_to_title(category.y)),
+         pair = fct_reorder(pair, lift)) |>
+  ggplot(aes(x = lift, y = pair)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  geom_col(fill = "#2c7fb8") +
+  geom_text(aes(label = restaurants_with_both), hjust = -0.2, size = 3.5) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "The selected categories appear together more than chance predicts",
+    subtitle = "Bar = lift (1 = no relationship); label = restaurants with both categories",
+    x = "Lift", y = NULL
+  ) +
+  theme_minimal()
+
+cooccur_plot
+```
+
+![](yelp_new_orleans_project_files/figure-commonmark/co-occurrence-plot-1.png)
+
+``` r
+ggsave("figures/category_cooccurrence.png", cooccur_plot,
+       width = 7, height = 4.5, dpi = 200, bg = "white")
+```
+
+``` r
+selected_restaurants <- nola_restaurants |>
+  semi_join(selected_ids, by = "business_id")
+```
+
+**Result:** 674 of the 2,261 New Orleans restaurants (29.8%) meet the
+inclusion rule.
+
+## Step 4: Join businesses to reviews
+
+The reviews are filtered to the selected restaurants **before** any
+further work, so reviews of unrelated businesses are not carried through
+the analysis. The review text is dropped here because Steps 4–7 don’t
+use it, which saves a lot of memory. The two tables are connected by
+`business_id` (one business, many reviews).
+
+``` r
+selected_reviews <- reviews |>
+  semi_join(selected_restaurants, by = "business_id") |>
+  select(any_of(c("review_id", "business_id", "user_id", "stars", "date",
+                  "useful", "funny", "cool")))
+
+rm(reviews); invisible(gc())   # the full review table is no longer needed
+
+review_summary <- selected_reviews |>
+  group_by(business_id) |>
+  summarise(
+    n_reviews         = n(),
+    mean_review_stars = mean(stars, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+selected_restaurants <- selected_restaurants |>
+  left_join(review_summary, by = "business_id") |>
+  mutate(n_reviews = replace_na(n_reviews, 0L))
+
+tibble(
+  check = c(
+    "Reviews of selected restaurants",
+    "Selected restaurants with at least 1 review",
+    "Selected restaurants with no reviews in the file",
+    "Reviews whose business_id has no match (should be 0)",
+    "Correlation: Yelp business stars vs. mean review stars"
+  ),
+  value = c(
+    comma(nrow(selected_reviews)),
+    comma(sum(selected_restaurants$n_reviews > 0)),
+    comma(sum(selected_restaurants$n_reviews == 0)),
+    comma(nrow(anti_join(selected_reviews, selected_restaurants,
+                         by = "business_id"))),
+    round(cor(selected_restaurants$stars,
+              selected_restaurants$mean_review_stars,
+              use = "complete.obs"), 3)
+  )
+) |>
+  kable()
+```
+
+| check                                                  | value   |
+|:-------------------------------------------------------|:--------|
+| Reviews of selected restaurants                        | 250,448 |
+| Selected restaurants with at least 1 review            | 674     |
+| Selected restaurants with no reviews in the file       | 0       |
+| Reviews whose business_id has no match (should be 0)   | 0       |
+| Correlation: Yelp business stars vs. mean review stars | 0.971   |
+
+## Step 5: Spatial join with the official New Orleans boundary
+
+Each restaurant’s latitude and longitude becomes a point. Each point is
+matched to the 2024 Census TIGER/Line **place** polygon that contains
+it. This gives a second geographic label, made independently of the Yelp
+`city` text.
+
+``` r
+la_places <- tryCatch(
+  places(state = "LA", cb = TRUE, year = 2024),
+  error = function(e) places(state = "LA", cb = TRUE, year = 2023)
+) |>
+  st_transform(4326) |>
+  st_make_valid()
+
+restaurant_points <- selected_restaurants |>
+  filter(!is.na(longitude), !is.na(latitude)) |>
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove = FALSE)
+
+restaurants_with_place <- restaurant_points |>
+  st_join(la_places |> select(place_geoid = GEOID, place_name = NAME),
+          join = st_within, left = TRUE) |>
+  distinct(business_id, .keep_all = TRUE)
+
+restaurants_with_place |>
+  st_drop_geometry() |>
+  mutate(place_name = replace_na(place_name,
+                                 "(not inside any Census place)")) |>
+  count(yelp_city = city, census_place = place_name, sort = TRUE,
+        name = "restaurants") |>
+  kable(caption = "Yelp city label vs. the Census place the point falls in")
+```
+
+| yelp_city   | census_place | restaurants |
+|:------------|:-------------|------------:|
+| New Orleans | New Orleans  |         656 |
+| New Orleans | Harahan      |           4 |
+| New Orleans | Jefferson    |           4 |
+| NEW ORLEANS | New Orleans  |           2 |
+| New Orleans | Elmwood      |           2 |
+| New Orleans | Arabi        |           1 |
+| New Orleans | Gretna       |           1 |
+| New Orleans | Harvey       |           1 |
+| New Orleans | Kenner       |           1 |
+| New Orleans | Metairie     |           1 |
+| New Orleans | River Ridge  |           1 |
+
+Yelp city label vs. the Census place the point falls in
+
+``` r
+n_inside  <- sum(restaurants_with_place$place_name == "New Orleans",
+                 na.rm = TRUE)
+n_outside <- nrow(restaurants_with_place) - n_inside
+cat(sprintf(
+  "**%s of %s** selected restaurants (%s) fall inside the official New Orleans boundary. The other **%s** have a Yelp city of \"New Orleans\" but coordinates outside it. The table above shows where they fall instead. Businesses in nearby Jefferson Parish suburbs often use \"New Orleans\" as their mailing-address city, and a few points may simply be geocoded slightly off. They were not deleted. They are kept in the geographic comparison below, where they show up as *unmatched* for any boundary system that covers only Orleans Parish.\n",
+  comma(n_inside), comma(nrow(restaurants_with_place)),
+  percent(n_inside / nrow(restaurants_with_place), 0.1), comma(n_outside)
+))
+```
+
+**658 of 674** selected restaurants (97.6%) fall inside the official New
+Orleans boundary. The other **16** have a Yelp city of “New Orleans” but
+coordinates outside it. The table above shows where they fall instead.
+Businesses in nearby Jefferson Parish suburbs often use “New Orleans” as
+their mailing-address city, and a few points may simply be geocoded
+slightly off. They were not deleted. They are kept in the geographic
+comparison below, where they show up as *unmatched* for any boundary
+system that covers only Orleans Parish.
+
+``` r
+new_orleans_boundary <- la_places |> filter(NAME == "New Orleans")
+
+# Zoom to where the restaurants are (the city boundary includes large
+# areas of marsh and water in New Orleans East).
+pts_xy <- st_coordinates(restaurant_points)
+view_x <- quantile(pts_xy[, 1], c(0.01, 0.99)) + c(-0.03, 0.03)
+view_y <- quantile(pts_xy[, 2], c(0.01, 0.99)) + c(-0.03, 0.03)
+
+place_map <- ggplot() +
+  geom_sf(data = new_orleans_boundary, fill = "grey95", color = "grey35") +
+  geom_sf(data = restaurants_with_place,
+          aes(color = stars,
+              shape = if_else(place_name %in% "New Orleans",
+                              "Inside city boundary", "Outside city boundary")),
+          alpha = 0.7, size = 1.4) +
+  scale_color_viridis_c(option = "C", limits = c(1, 5)) +
+  scale_shape_manual(values = c(16, 4)) +
+  coord_sf(xlim = view_x, ylim = view_y) +
+  labs(
+    title = "Classic New Orleans food restaurants on Yelp",
+    subtitle = "Grey area = official New Orleans city boundary (Census TIGER/Line)",
+    color = "Business\nstars", shape = NULL
+  ) +
+  theme_minimal()
+
+place_map
+```
+
+![](yelp_new_orleans_project_files/figure-commonmark/place-map-1.png)
+
+``` r
+ggsave("figures/restaurants_city_boundary.png", place_map,
+       width = 8, height = 6, dpi = 200, bg = "white")
+```
+
+## Step 6: Choose and defend a geographic area
+
+Three geographic systems were tested:
+
+| System | Source | Notes |
+|----|----|----|
+| ZIP Code Tabulation Areas (ZCTAs) | Census 2020, via `tigris` | Postal-style areas that people recognize, but not neighborhoods |
+| Census tracts | Census 2023, via `tigris` (Orleans, Jefferson, St. Bernard parishes) | Small statistical areas designed for population data |
+| Neighborhood Statistical Areas (NSAs) | City of New Orleans GIS (`LUP_LAB` = neighborhood name) | 72 official neighborhoods with names residents use; Orleans Parish only |
+
+``` r
+# ---- ZCTAs (ZIP codes starting 700/701 cover the metro area) ----------
+zcta_raw <- tryCatch(
+  zctas(cb = TRUE, year = 2020, starts_with = c("700", "701")),
+  error = function(e) zctas(cb = FALSE, year = 2020,
+                            starts_with = c("700", "701"))
+)
+zcta_id <- intersect(c("ZCTA5CE20", "GEOID20", "ZCTA5CE10", "GEOID10",
+                       "GEOID"), names(zcta_raw))[1]
+zcta_areas <- zcta_raw |>
+  st_transform(4326) |>
+  st_make_valid() |>
+  mutate(area_id = as.character(.data[[zcta_id]]),
+         area_name = paste("ZIP", area_id)) |>
+  select(area_id, area_name)
+
+# ---- Census tracts ------------------------------------------------------
+tract_areas <- tracts(state = "LA",
+                      county = c("Orleans", "Jefferson", "St. Bernard"),
+                      cb = TRUE, year = 2023) |>
+  st_transform(4326) |>
+  st_make_valid() |>
+  mutate(area_id = GEOID, area_name = paste("Tract", GEOID)) |>
+  select(area_id, area_name)
+
+# ---- Neighborhood Statistical Areas (City of New Orleans) --------------
+# The file is downloaded once and saved in data/boundaries/. If every URL
+# fails, download the GeoJSON by hand from
+# https://catalog.data.gov/dataset/neighborhood-statistical-area
+# and save it as data/boundaries/nsa.geojson.
+nsa_file <- "data/boundaries/nsa.geojson"
+nsa_urls <- c(
+  "https://gis.nola.gov/arcgis/rest/services/apps/BoundariesMayorysViewer/MapServer/3/query?where=1%3D1&outFields=*&outSR=4326&f=geojson",
+  "https://data.nola.gov/api/v3/views/exvn-jeh2/query.geojson?accessType=DOWNLOAD",
+  "https://data.nola.gov/resource/exvn-jeh2.geojson?$limit=5000"
+)
+if (!file.exists(nsa_file)) {
+  for (u in nsa_urls) {
+    ok <- tryCatch({
+      download.file(u, nsa_file, mode = "wb", quiet = TRUE)
+      nrow(st_read(nsa_file, quiet = TRUE)) > 0
+    }, error = function(e) FALSE)
+    if (isTRUE(ok)) break
+    if (file.exists(nsa_file)) file.remove(nsa_file)
+  }
+}
+
+nsa_areas <- NULL
+if (file.exists(nsa_file)) {
+  nsa_raw <- st_read(nsa_file, quiet = TRUE)
+  nsa_name <- intersect(c("LUP_LAB", "lup_lab", "GNOCDC_LAB", "gnocdc_lab",
+                          "NAME", "name", "neighborhood"), names(nsa_raw))[1]
+  nsa_areas <- nsa_raw |>
+    st_transform(4326) |>
+    st_make_valid() |>
+    mutate(area_name = str_to_title(str_squish(.data[[nsa_name]])),
+           area_id = area_name) |>
+    group_by(area_id, area_name) |>          # merge any multi-part rows
+    summarise(.groups = "drop")
+}
+
+systems <- list(
+  "ZIP code (ZCTA)" = zcta_areas,
+  "Census tract"    = tract_areas
+)
+if (!is.null(nsa_areas)) {
+  systems[["Neighborhood Statistical Area"]] <- nsa_areas
+}
+```
+
+``` r
+min_restaurants <- 5   # areas below this are too small to compare reliably
+
+assign_areas <- function(areas) {
+  restaurant_points |>
+    st_join(areas, join = st_within, left = TRUE) |>
+    st_drop_geometry() |>
+    distinct(business_id, .keep_all = TRUE)
+}
+
+summarise_areas <- function(assigned) {
+  assigned |>
+    filter(!is.na(area_id)) |>
+    group_by(area_id, area_name) |>
+    summarise(
+      restaurants            = n(),
+      avg_business_stars     = mean(stars, na.rm = TRUE),
+      median_business_stars  = median(stars, na.rm = TRUE),
+      pct_4_stars_plus       = mean(stars >= 4, na.rm = TRUE),
+      total_reviews          = sum(n_reviews),
+      avg_review_stars       = sum(mean_review_stars * n_reviews, na.rm = TRUE) /
+                               sum(n_reviews),
+      .groups = "drop"
+    ) |>
+    arrange(desc(restaurants))
+}
+
+assigned  <- map(systems, assign_areas)
+summaries <- map(assigned, summarise_areas)
+```
+
+### Comparison of geographic systems
+
+``` r
+comparison <- imap_dfr(summaries, function(s, sys) {
+  big <- s |> filter(restaurants >= min_restaurants)
+  tibble(
+    `Geographic system`                = sys,
+    `Areas with >=1 restaurant`         = nrow(s),
+    `Areas with >=5 restaurants`        = nrow(big),
+    `Restaurants assigned`             = sum(!is.na(assigned[[sys]]$area_id)),
+    `Unmatched restaurants`            = sum(is.na(assigned[[sys]]$area_id)),
+    `Smallest area count`              = min(s$restaurants),
+    `Median area count`                = median(s$restaurants),
+    `Largest area count`               = max(s$restaurants),
+    `% of restaurants in areas with >=5` = percent(sum(big$restaurants) /
+                                                   sum(s$restaurants), 1),
+    `Range of avg stars (areas with >=5)` = sprintf("%.2f to %.2f",
+                                         min(big$avg_business_stars),
+                                         max(big$avg_business_stars))
+  )
+})
+
+comparison |> kable()
+```
+
+| Geographic system | Areas with \>=1 restaurant | Areas with \>=5 restaurants | Restaurants assigned | Unmatched restaurants | Smallest area count | Median area count | Largest area count | % of restaurants in areas with \>=5 | Range of avg stars (areas with \>=5) |
+|:---|---:|---:|---:|---:|---:|---:|---:|:---|:---|
+| ZIP code (ZCTA) | 24 | 18 | 674 | 0 | 1 | 11 | 214 | 99% | 3.50 to 4.14 |
+| Census tract | 123 | 29 | 674 | 0 | 1 | 2 | 113 | 73% | 3.50 to 4.30 |
+| Neighborhood Statistical Area | 56 | 30 | 658 | 16 | 1 | 5 | 164 | 91% | 3.50 to 4.30 |
+
+### Small areas produce unstable averages
+
+Each point below is one area. In areas with only a few restaurants, a
+single very good or very bad restaurant pushes the average to an
+extreme. That is why the smallest geography is not automatically the
+most informative one.
+
+``` r
+funnel_data <- imap_dfr(summaries, ~ mutate(.x, system = .y))
+
+funnel_plot <- ggplot(funnel_data,
+                      aes(x = restaurants, y = avg_business_stars)) +
+  geom_vline(xintercept = min_restaurants, linetype = "dashed",
+             color = "firebrick") +
+  geom_point(alpha = 0.6, color = "#2c7fb8") +
+  scale_x_log10() +
+  facet_wrap(~ system) +
+  labs(
+    title = "Average stars become unstable in areas with few restaurants",
+    subtitle = sprintf("Dashed line = %d restaurants (minimum used for comparing areas)",
+                       min_restaurants),
+    x = "Selected restaurants in the area (log scale)",
+    y = "Average business stars"
+  ) +
+  theme_minimal()
+
+funnel_plot
+```
+
+![](yelp_new_orleans_project_files/figure-commonmark/funnel-plot-1.png)
+
+``` r
+ggsave("figures/area_size_vs_stars.png", funnel_plot,
+       width = 10, height = 4, dpi = 200, bg = "white")
+```
+
+### Maps of each geographic system
+
+Areas with fewer than 5 selected restaurants are grey. Black dots are
+the individual restaurants.
+
+``` r
+area_map <- function(sys) {
+  map_data <- systems[[sys]] |>
+    left_join(summaries[[sys]], by = c("area_id", "area_name")) |>
+    mutate(avg_plot = if_else(restaurants >= min_restaurants,
+                              avg_business_stars, NA_real_))
+  ggplot(map_data) +
+    geom_sf(aes(fill = avg_plot), color = "white", linewidth = 0.2) +
+    geom_sf(data = restaurant_points, size = 0.3, alpha = 0.35) +
+    scale_fill_viridis_c(option = "C", na.value = "grey85",
+                         name = "Average\nbusiness stars") +
+    coord_sf(xlim = view_x, ylim = view_y) +
+    labs(title = paste("Classic New Orleans food by", sys),
+         subtitle = sprintf("Grey = fewer than %d selected restaurants",
+                            min_restaurants)) +
+    theme_void()
+}
+
+for (sys in names(systems)) {
+  p <- area_map(sys)
+  print(p)
+  ggsave(sprintf("figures/map_%s.png",
+                 str_remove(str_replace_all(str_to_lower(sys), "[^a-z]+", "_"), "_$")),
+         p, width = 8, height = 6, dpi = 200, bg = "white")
+}
+```
+
+![](yelp_new_orleans_project_files/figure-commonmark/area-maps-1.png)
+
+![](yelp_new_orleans_project_files/figure-commonmark/area-maps-2.png)
+
+![](yelp_new_orleans_project_files/figure-commonmark/area-maps-3.png)
+
+### Decision
+
+``` r
+chosen_system <- if ("Neighborhood Statistical Area" %in% names(systems)) {
+  "Neighborhood Statistical Area"
+} else {
+  "ZIP code (ZCTA)"
+}
+chosen_row <- comparison |> filter(`Geographic system` == chosen_system)
+zcta_row   <- comparison |> filter(`Geographic system` == "ZIP code (ZCTA)")
+tract_row  <- comparison |> filter(`Geographic system` == "Census tract")
+```
+
+``` r
+if (chosen_system == "Neighborhood Statistical Area") {
+  cat(sprintf(
+"**Selected system: Neighborhood Statistical Areas (NSAs).**
+
+1. **It matches the question.** The question is *where a visitor should go*. People plan trips by neighborhood (the French Quarter, the Marigny, the Garden District, Uptown), not by ZIP code or census tract. NSAs are the City of New Orleans' official neighborhood boundaries, so every result has a name a general reader recognizes.
+2. **Enough restaurants for fair comparisons.** %s neighborhoods have at least %d selected restaurants, covering %s of the restaurants that were matched (the project requires at least 7 areas).
+3. **Census tracts are too small.** Tracts split the city into %s areas with restaurants, but the median tract has only %s selected restaurants. Only %s tracts reach %d restaurants, so tract averages are mostly noise from one or two businesses (see the plot above). Tract names (numbers) also mean nothing to a visitor.
+4. **ZIP codes are too coarse and cut across neighborhoods.** ZCTAs give stable counts (%s areas with >=%d restaurants), but a single ZIP code mixes very different places. For example, the French Quarter is split between ZIP codes it shares with Treme, the Marigny, and the Central Business District. A \"best ZIP code\" answer hides the neighborhood a visitor would actually walk to.
+5. **Trade-off: unmatched points.** NSAs cover Orleans Parish only, so %s restaurants with a Yelp city of \"New Orleans\" but suburban coordinates (Step 5) are unmatched, compared with %s for ZIP codes. Because the question is about New Orleans itself, dropping them from the area comparison is reasonable. The ZIP-code results are kept as a robustness check, and the final report will note whether the top areas agree.
+6. **Documented definitions.** NSA names and boundaries are published by the City of New Orleans, and the Census geographies are documented by TIGER/Line.
+
+**What NSAs hide:** a neighborhood average can mix an excellent block with a weak one, and large neighborhoods with few restaurants (e.g., in New Orleans East) are grey on the map rather than ranked. Areas below %d restaurants are reported but not ranked.\n",
+    chosen_row$`Areas with >=5 restaurants`, min_restaurants,
+    chosen_row$`% of restaurants in areas with >=5`,
+    tract_row$`Areas with >=1 restaurant`, tract_row$`Median area count`,
+    tract_row$`Areas with >=5 restaurants`, min_restaurants,
+    zcta_row$`Areas with >=5 restaurants`, min_restaurants,
+    comma(chosen_row$`Unmatched restaurants`),
+    comma(zcta_row$`Unmatched restaurants`),
+    min_restaurants
+  ))
+} else {
+  cat(sprintf(
+"**Selected system: ZIP Code Tabulation Areas.** (The City of New Orleans neighborhood file could not be downloaded, so the comparison is between ZCTAs and census tracts.)
+
+ZCTAs are familiar to a general audience, and %s of them have at least %d selected restaurants, which gives stable averages. Census tracts are too small: the median tract has only %s selected restaurants, and only %s tracts reach %d, so tract averages mostly reflect one or two businesses. Limitation: ZIP codes are not neighborhoods, and one ZIP code can mix very different areas.\n",
+    zcta_row$`Areas with >=5 restaurants`, min_restaurants,
+    tract_row$`Median area count`, tract_row$`Areas with >=5 restaurants`,
+    min_restaurants
+  ))
+}
+```
+
+**Selected system: Neighborhood Statistical Areas (NSAs).**
+
+1.  **It matches the question.** The question is *where a visitor should
+    go*. People plan trips by neighborhood (the French Quarter, the
+    Marigny, the Garden District, Uptown), not by ZIP code or census
+    tract. NSAs are the City of New Orleans’ official neighborhood
+    boundaries, so every result has a name a general reader recognizes.
+2.  **Enough restaurants for fair comparisons.** 30 neighborhoods have
+    at least 5 selected restaurants, covering 91% of the restaurants
+    that were matched (the project requires at least 7 areas).
+3.  **Census tracts are too small.** Tracts split the city into 123
+    areas with restaurants, but the median tract has only 2 selected
+    restaurants. Only 29 tracts reach 5 restaurants, so tract averages
+    are mostly noise from one or two businesses (see the plot above).
+    Tract names (numbers) also mean nothing to a visitor.
+4.  **ZIP codes are too coarse and cut across neighborhoods.** ZCTAs
+    give stable counts (18 areas with \>=5 restaurants), but a single
+    ZIP code mixes very different places. For example, the French
+    Quarter is split between ZIP codes it shares with Treme, the
+    Marigny, and the Central Business District. A “best ZIP code” answer
+    hides the neighborhood a visitor would actually walk to.
+5.  **Trade-off: unmatched points.** NSAs cover Orleans Parish only, so
+    16 restaurants with a Yelp city of “New Orleans” but suburban
+    coordinates (Step 5) are unmatched, compared with 0 for ZIP codes.
+    Because the question is about New Orleans itself, dropping them from
+    the area comparison is reasonable. The ZIP-code results are kept as
+    a robustness check, and the final report will note whether the top
+    areas agree.
+6.  **Documented definitions.** NSA names and boundaries are published
+    by the City of New Orleans, and the Census geographies are
+    documented by TIGER/Line.
+
+**What NSAs hide:** a neighborhood average can mix an excellent block
+with a weak one, and large neighborhoods with few restaurants (e.g., in
+New Orleans East) are grey on the map rather than ranked. Areas below 5
+restaurants are reported but not ranked.
+
+### Preliminary results for the chosen system
+
+These rankings use ordinary Yelp business stars. Step 7 will check
+whether they change once ratings are adjusted for each reviewer’s
+habits.
+
+``` r
+summaries[[chosen_system]] |>
+  filter(restaurants >= min_restaurants) |>
+  arrange(desc(avg_business_stars)) |>
+  slice_head(n = 10) |>
+  transmute(
+    Area                    = area_name,
+    Restaurants             = restaurants,
+    `Avg business stars`    = round(avg_business_stars, 2),
+    `Median stars`          = median_business_stars,
+    `% rated 4+`            = percent(pct_4_stars_plus, 1),
+    `Total reviews`         = comma(total_reviews),
+    `Avg review stars`      = round(avg_review_stars, 2)
+  ) |>
+  kable(caption = sprintf("Top 10 %ss for classic New Orleans food (areas with >=%d restaurants)",
+                          chosen_system, min_restaurants))
+```
+
+| Area | Restaurants | Avg business stars | Median stars | % rated 4+ | Total reviews | Avg review stars |
+|:---|---:|---:|---:|:---|:---|---:|
+| Bayou St. John | 5 | 4.30 | 4.5 | 80% | 2,709 | 4.48 |
+| Freret | 5 | 4.30 | 4.0 | 100% | 1,047 | 4.14 |
+| Seventh Ward | 13 | 4.27 | 4.0 | 85% | 1,672 | 4.15 |
+| Fairgrounds - Broad | 8 | 4.19 | 4.5 | 88% | 401 | 4.21 |
+| Sixth Ward - Treme - Lafitte | 9 | 4.17 | 4.5 | 78% | 5,329 | 4.17 |
+| Uptown | 11 | 4.09 | 4.0 | 73% | 2,002 | 4.04 |
+| Leonidas - West Carrollton | 18 | 4.06 | 4.5 | 67% | 5,439 | 4.26 |
+| Bywater | 13 | 4.04 | 4.0 | 92% | 4,440 | 4.13 |
+| Marigny | 21 | 4.02 | 4.0 | 76% | 6,160 | 3.95 |
+| Edgelake - Little Woods | 8 | 4.00 | 4.0 | 62% | 438 | 4.17 |
+
+Top 10 Neighborhood Statistical Areas for classic New Orleans food
+(areas with \>=5 restaurants)
+
+``` r
+bar_data <- summaries[[chosen_system]] |>
+  filter(restaurants >= min_restaurants) |>
+  arrange(desc(avg_business_stars)) |>
+  slice_head(n = 15) |>
+  mutate(area_name = fct_reorder(area_name, avg_business_stars))
+
+chosen_bar <- ggplot(bar_data, aes(x = avg_business_stars, y = area_name)) +
+  geom_col(fill = "#2c7fb8") +
+  geom_text(aes(label = paste0("n = ", restaurants)),
+            hjust = 1.1, color = "white", size = 3.2) +
+  coord_cartesian(xlim = c(1, 5)) +
+  labs(
+    title = sprintf("Highest-rated areas (%s)", chosen_system),
+    subtitle = sprintf("Classic New Orleans food; areas with >=%d restaurants; n = restaurants",
+                       min_restaurants),
+    x = "Average business stars", y = NULL
+  ) +
+  theme_minimal()
+
+chosen_bar
+```
+
+![](yelp_new_orleans_project_files/figure-commonmark/chosen-bar-1.png)
+
+``` r
+ggsave("figures/top_areas_bar.png", chosen_bar,
+       width = 8, height = 6, dpi = 200, bg = "white")
+```
+
+``` r
+# Save the joined data for Step 7 (stays local; data/ is in .gitignore)
+saveRDS(
+  list(selected_restaurants = selected_restaurants,
+       selected_reviews     = selected_reviews,
+       assigned             = assigned,
+       chosen_system        = chosen_system),
+  "data/steps_1_6_outputs.rds"
+)
+```
+
+## Data sources
+
+- Yelp Open Dataset:
+  <https://business.yelp.com/data/resources/open-dataset/>
+- U.S. Census TIGER/Line files (places, ZCTAs, tracts) via the `tigris`
+  R package: <https://walker-data.com/tigris/>
+- City of New Orleans, Neighborhood Statistical Areas:
+  <https://catalog.data.gov/dataset/neighborhood-statistical-area>
